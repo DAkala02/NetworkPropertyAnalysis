@@ -1,0 +1,188 @@
+---
+title: "Vignette Title"
+author: "Vignette Author"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# Overview 
+This vignette explains how to use the NPADistThresholdDetermination() function to estimate the optimal spatial distance threshold for constructing transcriptomic graphs. The function iterates across a range of diameter values, calculates graph metrics, and finds the intersection point between Connectedness and Sparsity curves. More specifically, to perform downstream spatial network analysis, we need to define a distance threshold that governs whether an edge exists between two transcripts. This function systematically evaluates several candidate diameters to estimate the optimal value—balancing the trade-off between overly sparse and overly connected networks.
+
+# Parameters
+```{r}
+#' @param CellFile File path to the CSV file that contains the raw cellular data from Xenium
+#' @param OutputDir Directory created in the function NPADataAcqOrg containing combined cell+gene CSV files.
+#' @param MetricsExcelPath File path to save Excel workbook with network properties for each diameter.
+```
+
+The `get_diameter_range()` helper function is a crucial preprocessing step in determining the optimal graph construction threshold for spatial transcriptomic data. It reads a CSV containing cell-level data, specifically extracting the `cell_area` values to estimate the effective physical diameter of each cell. Using the formula for the diameter of a circle from area, it converts area values into estimated diameters. The function then calculates both the average diameter across all valid cells (used later as a reference point in plotting and threshold selection) and a complete integer range of diameters spanning from the smallest to the largest observed cell. These two outputs—`range` and `avg`—serve as the foundational input for downstream metric computations across a range of possible spatial thresholds, making this function essential for scaling the graph-based analysis to the biological dimensions of the data.
+```{r}
+ # Helper Function 1: Calculate Diameter Range 
+  get_diameter_range <- function(cell_file) {
+    cell_data <- data.table::fread(cell_file)
+    diameter <- cell_data$cell_area |> 
+      na.omit() |> 
+      (\(x) 2 * sqrt(x / pi))()
+    
+    avg_diameter <- mean(diameter, na.rm = TRUE)
+    range <- round(min(diameter)):round(max(diameter))
+    list(range = range, avg = avg_diameter)
+  }
+```
+
+The `process_csv()` function is responsible for computing essential graph metrics from a single cell-gene CSV file at a specific spatial threshold (diameter). It begins by reading the input file, which contains transcript coordinates for a specific gene within a cell, and exits early if the data is malformed or too sparse. It then calculates the pairwise Euclidean distance matrix between transcript coordinates and builds a sparse adjacency matrix where edges are formed if the distance between nodes is less than the specified diameter. Using this adjacency matrix, it constructs an undirected graph and extracts key network properties: mean degree (node connectivity), number of nodes, the count of `NA` values, and the count of zero entries in the adjacency matrix (adjusted for the diagonal). These metrics are returned as a row in a data frame, which will later contribute to determining the optimal spatial threshold across all gene-cell combinations. This function is central to quantifying local network structure and data sparsity in spatial transcriptomics.
+```{r}
+# Helper Function 2: Process One CSV 
+  process_csv <- function(file_path, diam, cell_id, gene) {
+    df <- tryCatch(data.table::fread(file_path), error = function(e) return(NULL))
+    if (is.null(df) || nrow(df) < 2 || !all(c("x_location", "y_location") %in% names(df))) return(NULL)
+    
+    dist_mat <- proxy::dist(df[, c("x_location", "y_location")])
+    adj <- Matrix::Matrix(0, nrow = nrow(df), ncol = nrow(df), sparse = TRUE)
+    adj[which(dist_mat < diam & dist_mat > 0, arr.ind = TRUE)] <- 1
+    
+    graph <- igraph::graph_from_adjacency_matrix(adj, mode = "undirected")
+    data.frame(
+      CellID = cell_id,
+      Gene = gene,
+      Diameter = diam,
+      MeanDegree = mean(igraph::degree(graph)),
+      NumNodes = igraph::vcount(graph),
+      NumNA = sum(is.na(adj)),
+      NumZero = sum(adj == 0) - igraph::vcount(graph)
+    )
+  }
+```
+
+The `process_diameter()` function calculates graph-based metrics for **all cell-gene transcript datasets** at a specific spatial threshold (`diam`). It loops through a hierarchical folder structure created during preprocessing, where each subdirectory represents a single cell and contains further subfolders for each gene. For every CSV file in these folders (each representing a single cell-gene combination), it calls the previously defined `process_csv()` function to compute metrics like mean degree and number of nodes. These results are aggregated into a single data frame (`metrics_df`) for that diameter. The function also writes this data to a new worksheet in an Excel workbook (one sheet per diameter), enabling downstream visualization and comparison. This function is essential for **batch-processing across spatial thresholds**, providing the backbone for selecting an optimal diameter in spatial network analysis.
+```{r}
+# Helper Function 3: Process One Diameter 
+  process_diameter <- function(diam) {
+    message("Processing Diameter: ", diam)
+    SampledCellDirs <- list.dirs(OutputDir, recursive = FALSE, full.names = TRUE)
+    
+    metrics <- lapply(SampledCellDirs, function(cell_path) {
+      cell_id <- basename(cell_path)
+      gene_dirs <- list.dirs(cell_path, recursive = FALSE, full.names = TRUE)
+      
+      do.call(rbind, lapply(gene_dirs, function(gene_path) {
+        gene <- basename(gene_path)
+        csv_files <- list.files(gene_path, pattern = "\\.csv$", full.names = TRUE)
+        csv_metrics <- lapply(csv_files, function(file) {
+          process_csv(file, diam, cell_id, gene)
+        })
+        do.call(rbind, csv_metrics)
+      }))
+    })
+    
+    metrics_df <- do.call(rbind, metrics)
+    openxlsx::addWorksheet(wb, paste0("D", diam))
+    openxlsx::writeData(wb, sheet = paste0("D", diam), x = metrics_df)
+    metrics_df
+  }
+```
+
+This block of code initializes the **first step of distance threshold optimization** by calling the helper function `get_diameter_range()` with the `CellFile` as input. The function reads in cellular area data and converts it into a range of **cell diameters**—a biologically meaningful measure for defining neighborhood size in spatial graphs. The `DiameterRange` variable holds the sequence of integer diameters (from smallest to largest), which will be iterated over to test different thresholds. The `AverageDiameter` is the mean diameter across all cells and is used later for visualization (e.g., as a reference line in plots). This step is crucial because it defines the **parameter search space** for determining the optimal spatial threshold that best captures transcriptomic interactions.
+```{r}
+# Step 1: Compute Diameter Range 
+  diam_info <- get_diameter_range(CellFile)
+  DiameterRange <- diam_info$range
+  AverageDiameter <- diam_info$avg
+```
+
+This section sets up and executes the **main computational workflow** for estimating an optimal distance threshold by analyzing graph-based metrics at each diameter value. First, it creates a new Excel workbook `wb` using `openxlsx::createWorkbook()` to store per-diameter network results. Then, it loops through each candidate diameter in `DiameterRange` and calls the previously defined helper function `process_diameter()`, which reads in spatial transcriptomic data, builds graphs, calculates metrics like Mean Degree and Sparsity, and writes each set of results to a separate worksheet. The complete workbook is then saved to `MetricsExcelPath`, ensuring that all intermediate results are available for review or downstream analysis. This step is critical for enabling threshold selection based on **systematic metric evaluation across spatial scales**.
+```{r}
+# Step 2: Create Workbook and Compute Metrics 
+  wb <- openxlsx::createWorkbook()
+  metrics_list <- lapply(DiameterRange, process_diameter)
+  openxlsx::saveWorkbook(wb, MetricsExcelPath, overwrite = TRUE)
+```
+
+This section implements the **threshold estimation logic** by summarizing key graph metrics—**Connectedness** and **Sparsity**—across the range of diameters. For each worksheet (corresponding to a tested diameter), it reads the saved network metrics from the Excel file using `openxlsx::readWorkbook()`. It then calculates:
+
+* **Connectedness**, defined as the average degree normalized by the number of nodes minus one (indicating how interconnected the network is).
+* **Sparsity**, computed as the proportion of missing and zero edges normalized by the square of the number of nodes (indicating how sparse the graph is).
+
+These two metrics are returned for each diameter and collected into a matrix using `sapply()`. This step is crucial for identifying the **balance point** where networks are sufficiently connected without being overly dense, forming the basis for selecting the optimal distance threshold used in downstream network construction.
+
+```{r}
+# Step 3: Estimate Optimal Threshold 
+  metric_summary <- sapply(DiameterRange, function(diam) {
+    sheetname <- paste0("D", diam)
+    df <- tryCatch(openxlsx::readWorkbook(MetricsExcelPath, sheet = sheetname), error = function(e) NULL)
+    if (is.null(df) || !all(c("MeanDegree", "NumNodes", "NumNA", "NumZero") %in% names(df))) return(c(NA, NA))
+    
+    df <- df |>
+      dplyr::mutate(
+        Connectedness = MeanDegree / pmax(NumNodes - 1, 1),
+        Sparsity = (NumNA + NumZero) / pmax(NumNodes^2, 1)
+      )
+    c(mean(df$Connectedness, na.rm = TRUE), mean(df$Sparsity, na.rm = TRUE))
+  })
+```
+
+This code block creates a **summary data frame (`ParameterDF`)** that consolidates the Connectedness and Sparsity metrics computed for each diameter value into a structured format for further analysis. Here's what each part does:
+
+* `Diameter = DiameterRange`: Assigns the tested diameters (e.g., 5 to 15 µm) as the first column.
+* `Connectedness = metric_summary[1, ]`: Pulls the Connectedness values (row 1 of `metric_summary`) for each diameter.
+* `Sparsity = metric_summary[2, ]`: Pulls the Sparsity values (row 2 of `metric_summary`).
+
+The pipe (`|>`) into `tidyr::drop_na()` removes any rows that have missing values in either metric, ensuring clean data for visualization or model fitting. This cleaned `ParameterDF` forms the foundation for plotting trends or performing LOESS smoothing to find the **optimal network connectivity threshold**.
+```{r}
+  ParameterDF <- data.frame(
+    Diameter = DiameterRange,
+    Connectedness = metric_summary[1, ],
+    Sparsity = metric_summary[2, ]
+  ) |> tidyr::drop_na()
+```
+
+This code block generates and saves a **diagnostic plot** that visually compares how two key network metrics—**Connectedness** and **Sparsity**—change across different graph diameter thresholds, helping determine the optimal threshold for spatial network construction. This visualization is **crucial** for choosing the optimal diameter threshold: it shows where the **Connectedness and Sparsity curves intersect or balance**, guiding a biologically meaningful cutoff for defining spatial proximity in network analysis.
+
+```{r}
+PlotDF <- tidyr::pivot_longer(ParameterDF, cols = c("Connectedness", "Sparsity"), names_to = "Metric", values_to = "Value")
+  Plot <- ggplot2::ggplot(PlotDF, ggplot2::aes(x = Diameter, y = Value, color = Metric)) +
+    ggplot2::geom_point(size = 2) +
+    ggplot2::geom_smooth(method = "loess", se = FALSE, formula = y ~ x, linetype = "dashed") +
+    ggplot2::geom_vline(xintercept = AverageDiameter, linetype = "dotdash", color = "black", size = 1) +
+    ggplot2::labs(title = "Connectedness vs Sparsity Across Diameters", y = "Metric Value", x = "Diameter") +
+    ggplot2::theme_minimal()
+  
+  ggplot2::ggsave("C:/Users/daivi/Documents/Daivic/Summer 2024/ND16090 T2D 0017308/Package Test/Distance Threshold Plot.pdf", Plot)
+  
+```
+
+This final section determines the optimal distance threshold for constructing spatial transcriptomic networks by balancing two competing metrics: Connectedness and Sparsity. LOESS smoothing is applied to each metric across a range of diameters to model their non-linear trends. A fine-grained sequence of diameters is then generated, and the predicted values from each LOESS model are compared. The diameter at which the absolute difference between Connectedness and Sparsity is minimized—indicating their point of closest convergence—is selected as the optimal threshold. This threshold reflects a biologically meaningful balance where networks are neither overly dense nor excessively sparse, enabling robust and interpretable graph-based analyses of transcriptomic spatial structure. The chosen threshold is printed for reference and returned for use in subsequent calculations.
+```{r}
+  LoessConnectedness <- loess(Connectedness ~ Diameter, data = ParameterDF)
+  LoessSparsity <- loess(Sparsity ~ Diameter, data = ParameterDF)
+  
+  diam_seq <- seq(min(ParameterDF$Diameter), max(ParameterDF$Diameter), by = 0.1)
+  y1 <- predict(LoessConnectedness, newdata = data.frame(Diameter = diam_seq))
+  y2 <- predict(LoessSparsity, newdata = data.frame(Diameter = diam_seq))
+  DistanceThreshold <- round(diam_seq[which.min(abs(y1 - y2))])
+  
+  cat(sprintf("🎯 Optimal Distance Threshold: %d\n", DistanceThreshold))
+  return(DistanceThreshold)
+```
+
+# Sample Function Call
+```{r}
+NPADistThresholdDetermination(
+  CellFile = "C:/Users/daivi/Documents/Daivic/Summer 2025/IBRI/ND16090 T2D 0017308/cells.csv",  
+  OutputDir = "C:/Users/daivi/Documents/Daivic/Summer 2025/IBRI/ND16090 T2D 0017308/Package Test/CellGeneDirectories",
+  MetricsExcelPath = "C:/Users/daivi/Documents/Daivic/Summer 2025/IBRI/ND16090 T2D 0017308/Package Test/Metrics.xlsx",
+  PlotPath = "C:/Users/daivi/Documents/Daivic/Summer 2025/ND16090 T2D 0017308/Package Test/Distance Threshold Plot.pdf"
+)
+```
+

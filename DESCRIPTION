@@ -1,0 +1,29 @@
+Package: NetworkPropertyAnalysis
+Type: Package
+Title: Network Property Analysis for Spatial Transcriptomic Data
+Version: 0.1.0
+Authors@R: c(
+    person("Daivic","Akala", email = "daivicakala@gmail.com",role = c("aut", "cre")
+    )
+)
+Description: This package provides tools for computing network-based metrics from spatial
+    transcriptomic data, including data preprocessing, optimal distance threshold
+    estimation, and parallelized graph property calculation for cell-gene pairs.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Depends: R (>= 4.1.0)
+Imports: 
+    data.table,
+    igraph,
+    Matrix,
+    Rfast,
+    foreach,
+    doParallel,
+    parallel,
+    openxlsx,
+    proxy,
+    dplyr,
+    tidyr,
+    ggplot2
+RoxygenNote: 7.3.1

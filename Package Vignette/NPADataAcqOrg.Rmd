@@ -1,0 +1,99 @@
+---
+title: "Vignette for NPA Data Acquisition and Organization"
+author: "Daivic Akala"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# Overview
+This vignette demonstrates how to use the NPADataAcqOrg() function from the NetworkPropertyAnalysis package. Specifically, the NPADataAcqOrg() function processes raw Xenium output transcript data in the form of a CSV file, selects and organizes relevant columns (cell_id, feature_name, x_location, y_location), saves both the full grouped data set and a sampled subset to determine additional parameters, and builds a hierarchal directory by Cell and Gene, saving individual .csv files for each identified gene within each sampled cell
+
+# Parameters
+```{r}
+#' @param TranscriptFile Describes the file path to the CSV file that contains the raw transcript data from Xenium
+#' @param OutputDir Directory created to save intermediate CSV files
+#' @param GroupedPath Describes the file path to the CSV file that contains the grouped information from the GroupedData variable
+#' @param GroupedSamplePath Describes the file path to the CSV file that contains the grouped information from the SampleData variable
+#' @param SampleSize Number of cells to sample for Distance Threshold Determination (Default 1000)
+#' @param Seed Random seed value for reproducibility (Default 123)
+```
+
+This section of the code reads the transcript-level spatial data from a CSV file into a data.table using fread(), which is optimized for fast I/O. It then selects only the relevant columns (cell_id, transcript_id, feature_name, x_location, and y_location) and ensures the result is a data.table. The data is sorted by cell_id and feature_name to prepare for downstream organization. If a valid GroupedPath is provided, the filtered and sorted data is saved to that file using fwrite(). Finally, the table is keyed on cell_id and feature_name, which enables efficient subsetting and joins in later steps of the pipeline.
+
+```{r}
+TranscriptData <- data.table::fread(TranscriptFile)
+  SelectedData <- data.table::as.data.table(TranscriptData)[, c("cell_id", "transcript_id", "feature_name", "x_location", "y_location"), with = FALSE]
+  GroupedData <- SelectedData[order(cell_id, feature_name)]
+  if (!is.null(GroupedPath)) {
+    data.table::fwrite(GroupedData, GroupedPath, row.names = FALSE)
+  }
+  data.table::setkey(data.table::setDT(GroupedData), cell_id, feature_name)
+```
+
+This section of the code performs random sampling and prepares the output directory for organized storage. First, it sets the random seed using `set.seed(Seed)` to ensure reproducibility of the sampled cells. It then randomly selects a subset of unique `cell_id`s from the grouped data, equal in number to `SampleSize`. The transcripts corresponding to these sampled cells are extracted into `SampledData`. If a file path is provided for `GroupedSamplePath`, the sampled subset is saved as a CSV using `fwrite()`. Finally, the output directory specified by `OutputDir` is created (if it doesn’t already exist), allowing subsequent data files to be stored in an organized folder structure.
+
+```{r}
+  set.seed(Seed)
+  SampledCells <- sample(unique(GroupedData$cell_id), size = SampleSize)
+  SampledData <- GroupedData[cell_id %in% SampledCells]
+
+  if (!is.null(GroupedSamplePath)) {
+    data.table::fwrite(SampledData, GroupedSamplePath, row.names = FALSE)
+  }
+
+  dir.create(OutputDir, recursive = TRUE, showWarnings = FALSE)
+```
+
+This section organizes and saves the sampled transcriptomic data into a structured folder hierarchy. It begins by identifying all unique cell IDs (`UniqueCells`) from the `SampledData` and calculating the total number of sampled cells (`nCells`). For each cell, it extracts the subset of data (`CellDataSubset`) corresponding to that cell and creates a directory named `Cell_<cell_id>` within the specified `OutputDir`. Inside each cell's directory, it iterates through all unique genes (`UniqueGenes`) expressed in that cell. For each gene, it extracts the corresponding transcripts (`GeneData`), creates a subdirectory `Gene_<gene>`, and writes the gene-specific data to a uniquely named CSV file. Throughout the loop, progress is displayed in the console using `cat()` and `flush.console()`, showing the percentage of cells processed. This structured output is essential for downstream analyses that depend on per-cell and per-gene data organization.
+
+```{r}
+UniqueCells <- unique(SampledData$cell_id)
+  nCells <- length(UniqueCells)
+
+  for (i in seq_along(UniqueCells)) {
+    Cell <- UniqueCells[i]
+    CellDataSubset <- SampledData[cell_id == Cell]
+    CellDir <- file.path(OutputDir, paste0("Cell_", Cell))
+    dir.create(CellDir, showWarnings = FALSE, recursive = TRUE)
+
+    UniqueGenes <- unique(CellDataSubset$feature_name)
+
+    for (gene in UniqueGenes) {
+      GeneData <- CellDataSubset[feature_name == gene]
+      if (nrow(GeneData) == 0) next
+      GeneDir <- file.path(CellDir, paste0("Gene_", gene))
+      dir.create(GeneDir, showWarnings = FALSE, recursive = TRUE)
+      OutputFile <- file.path(GeneDir, paste0("Gene_", gene, "_Cell_", Cell, "_Data.csv"))
+      data.table::fwrite(GeneData, OutputFile)
+    }
+
+    #Progress Reporting
+    ProgressPercent <- (i / nCells) * 100
+    cat(sprintf("Directory Creation Progress: %.1f%% \r", ProgressPercent))
+    flush.console()
+  }
+```
+
+# Sample Function Call
+```{r}
+NPADataAcqOrg(
+ TranscriptFile = "C:/Users/daivi/Documents/Daivic/Summer 2025/IBRI/ND16090 T2D 0017308/transcripts.csv",
+  OutputDir = "C:/Users/daivi/Documents/Daivic/Summer 2025/IBRI/ND16090 T2D 0017308/Package Test/CellGeneDirectories",
+  GroupedPath = "C:/Users/daivi/Documents/Daivic/Summer 2025/IBRI/ND16090 T2D 0017308/Package Test/Grouped Data.csv",
+  GroupedSamplePath = "C:/Users/daivi/Documents/Daivic/Summer 2025/IBRI/ND16090 T2D 0017308/Package Test/Grouped Sample Data.csv",
+  SampleSize = 1000,
+  Seed = 123
+)
+```
+

@@ -1,0 +1,16 @@
+# RStudio Files
+.Rproj.user/
+.Rhistory
+.RData
+
+# Vignettes
+Vignettes/*.Rmd
+
+
+# Man Pages
+*.Rd
+
+# Documentation Artifacts
+man/
+
+

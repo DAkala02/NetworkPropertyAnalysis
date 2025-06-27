@@ -1,0 +1,101 @@
+---
+title: "Vignette Title"
+author: "Vignette Author"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# Overview
+This vignette explains how the NPANetPropsCalc() function calculates graph-based network properties across spatial transcriptomic data generated from Xenium. Each transcriptomic graph is constructed for a cell-gene pair using a pre-determined Distance Threshold from NPADistThresholdDetermination(), and network metrics are computed in parallel to improve performance. The function takes organized transcript spatial coordinates (typically preprocessed using NPADataAcqOrg()), then constructs a graph for each gene's transcripts within each cell. Nodes represent transcripts, and edges are created between nodes closer than the provided distance threshold. It computes several meaningful network metrics and outputs a unified CSV file with results.
+
+# Parameters
+```{r}
+#' @param GroupedFile A CSV file of filtered and organized transcript locations with columns: 
+#' cell_id, feature_name, x_location, y_location.
+#' @param DistanceThreshold Numeric distance threshold used to define graph edges (output of previous function).
+#' @param MasterNetworkFile File path where the final network metrics CSV will be saved.
+```
+
+This code snippet sets up parallel processing to speed up computation, particularly useful when working with large spatial transcriptomic datasets. First, it creates a cluster using all available CPU cores detected by `parallel::detectCores()`, then registers this cluster with the `doParallel` package to enable parallel execution with `foreach`. Next, it reads in the transcriptomic data from a CSV file using `data.table::fread`, which efficiently loads the data into memory as a `data.table`. It extracts all unique cell identifiers to later iterate over each cell individually. Finally, it sets a key on the `GroupedData` table for the `cell_id` column to optimize subsequent data operations, allowing fast subset and join operations by cell. This setup is critical for efficient parallelized network property calculations on a per-cell basis.
+```{r}
+cl <- parallel::makeCluster(parallel::detectCores())
+  doParallel::registerDoParallel(cl)
+  
+  GroupedData <- data.table::fread(GroupedFile)
+  AllCells <- unique(GroupedData$cell_id)
+  data.table::setkey(GroupedData, cell_id)
+```
+
+This code block performs parallel computation of graph-based network properties for each cell-gene pair using the `%dopar%` operator from the `foreach` package to run iterations concurrently across multiple CPU cores. It iterates over all unique cells, subsets the data for each cell, and then further iterates over each gene expressed in that cell. For each gene, it extracts spatial coordinates of transcripts, calculates pairwise squared Euclidean distances, and builds a sparse adjacency matrix connecting points within the specified distance threshold. An undirected graph is constructed from this adjacency matrix, and if edges exist, several network metrics such as mean degree, mean betweenness, average path length, modularity, density, and clustering coefficient are computed using `igraph` functions. The results for each gene-cell pair are collected into a list and combined into a data table. After completing all parallel tasks, the cluster used for parallelization is cleanly shut down to free resources. This approach dramatically speeds up the analysis by leveraging multiple cores for the large-scale network computations needed in spatial transcriptomics.
+```{r}
+`%dopar%` <- foreach::`%dopar%`
+  results <- foreach::foreach(i = seq_along(AllCells),
+                              .packages = c("data.table", "igraph", "Matrix", "Rfast")) %dopar% {
+                                
+                                Cell <- AllCells[i]
+                                CellData <- GroupedData[data.table::J(Cell)]
+                                if (nrow(CellData) == 0) return(NULL)
+                                
+                                result_list <- list()
+                                
+                                for (Gene in unique(CellData$feature_name)) {
+                                  GeneData <- CellData[feature_name == Gene]
+                                  if (nrow(GeneData) < 1 || nrow(GeneData) > 1000) next
+                                  
+                                  coords <- as.matrix(GeneData[, .(x_location, y_location)])
+                                  DistMat <- Rfast::Dist(coords, method = "euclidean", square = TRUE)
+                                  
+                                  AdjMat <- Matrix::Matrix(0, nrow = nrow(GeneData), ncol = nrow(GeneData), sparse = TRUE)
+                                  AdjMat[which(DistMat < DistanceThreshold^2 & DistMat > 0, arr.ind = TRUE)] <- 1
+                                  
+                                  Graph <- igraph::graph_from_adjacency_matrix(AdjMat, mode = "undirected")
+                                  
+                                  if (igraph::ecount(Graph) > 0) {
+                                    NetStats <- data.table::data.table(
+                                      Gene = Gene,
+                                      CellID = Cell,
+                                      MeanDegree = mean(igraph::degree(Graph)),
+                                      MeanBetweenness = mean(igraph::betweenness(Graph, normalized = TRUE)),
+                                      AvgPathLength = igraph::mean_distance(Graph, directed = FALSE),
+                                      GraphModularity = igraph::modularity(igraph::cluster_fast_greedy(Graph)),
+                                      GraphDensity = igraph::edge_density(Graph),
+                                      MeanClusteringCoefficient = igraph::transitivity(Graph, type = "average")
+                                    )
+                                    result_list[[length(result_list) + 1]] <- NetStats
+                                  }
+                                }
+                                
+                                data.table::rbindlist(result_list)
+                              }
+  
+  parallel::stopCluster(cl)
+```
+
+This code consolidates all the parallel computation results stored in the `results` list into a single `data.table` called `FinalResults` using `rbindlist()`, which efficiently binds the rows together while preserving column names and handling missing columns with `fill = TRUE`. It then writes this combined data table to disk as a CSV file at the specified path `MasterNetworkFile` using `fwrite()`, ensuring fast and reliable file output. Finally, it prints a confirmation message to the console indicating successful saving of all network property results, providing clear user feedback.
+```{r}
+  FinalResults <- data.table::rbindlist(results, use.names = TRUE, fill = TRUE)
+  data.table::fwrite(FinalResults, MasterNetworkFile)
+  
+  cat("✅ All Network Properties saved into:", MasterNetworkFile, "\n")
+```
+
+#Sample Function Call
+```{r}
+NPANetPropsCalc(
+GroupedFile = "C:/Users/daivi/Documents/Daivic/Summer 2025/IBRI/ND16090 T2D 0017308/Package Test/Grouped Data.csv",
+DistanceThreshold = 7,
+MasterNetworkFile = "C:/Users/daivi/Documents/Daivic/Summer 2025/IBRI/ND16090 T2D 0017308/Package Test/MasterNetworkProperties.csv"
+)
+```
+
